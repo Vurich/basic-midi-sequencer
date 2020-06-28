@@ -13,3 +13,6 @@ num-integer = "0.1"
 serde = "1.0"
 ron = "0.6"
 arraytools = "0.1"
+
+[features]
+nightly = []

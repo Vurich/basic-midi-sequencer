@@ -1,92 +1,21 @@
 #![warn(missing_docs, clippy::missing_docs_in_private_items)]
-
-//! # Simple MIDI sequencer
-//!
-//! A simplistic sequencer that acts on MIDI files. It supports "playing" the
-//! sequence (actually just printing the sequence and parameter changes to
-//! stdout) or writing to a MIDI file. You can choose from multiple voices,
-//! with different sets of parameters, which are encoded using MIDI program
-//! changes and MIDI CC for the parameters.
-//!
-//! The sequences can be arbitrary fractions of the host BPM, although if the
-//! divisor isn't a multiple of 3 or 2 then it will probably slowly drift
-//! because of inaccuracies in the division of `TICKS_PER_BEAT`. A real project
-//! would prevent this at runtime by disallowing values for this BPM fraction
-//! that would cause inaccuracies, or possibly by using floating-/fixed-point
-//! maths along with some extra logic to keep the tracks in sync.
-//!
-//! ## Usage
-//!
-//! The input is just an enum with a `serde::Deserialize` impl, deserialized
-//! with [RON](https://github.com/ron-rs/ron). So for a list of the available
-//! commands, see the `Command` enum, and for an example of how to write that
-//! on the command line, see the documentation for RON. For an example of how
-//! to set parameters on the sequencer, see `filetests/simple.input`. When
-//! you want to see the output, either use `Start(..)` to write the messages
-//! to stdout for the given period of time, or use `StartWrite`, use some
-//! commands (such as `Tick` or even `Start`) and then save an output MIDI
-//! file using `EndWrite("/path/to/output")`. The syntax of RON is very
-//! similar to that of Rust, so it should be pretty simple to understand.
-//!
-//! ### Some notes
-//!
-//! - The code is a little overengineered, as I had committed to being able to
-//!   save MIDI files, to being able to edit the sequences on-the-fly, and to
-//!   being able to step the sequencer by arbitrary numbers of ticks. These
-//!   constraints are self-imposed, though, and in a real project you might be
-//!   able to relax many of them in order to make the code a bit simpler.
-//! - Relatedly, I've kept all the code in one file since (in my opinion) it makes
-//!   it easier to review the whole project on GitHub and similar. It's still below
-//!   1000SLC (much of the size of the file is comments and docs) so it's debatable
-//!   whether or not it should be split into modules yet.
-//! - I've chosen not to make it multi-threaded, so while you can edit sequences
-//!   while they're playing, this is done by using a `Tick` function to progress
-//!   time. In other words, it's asynchronous but not concurrent. I did this so
-//!   that when operating it on the command line you don't have the input and output
-//!   overwriting one another. The best way to make this multi-threaded would be to
-//!   separate the parts of `Sequencer` and `Sequence` which are updated in
-//!   response to user input but only read on tick, such as the sequences
-//!   themselves, from the parts of `Sequencer` and `Sequence` which are unneeded
-//!   when handling user input but written on tick, such as `Sequence::cur_note`.
-//!   You could also just put the whole `Sequencer` in a `Mutex`, which is a lot
-//!   easier and should do the job in most cases.
-//! - In many places I've returned an `impl Iterator` instead of a collection,
-//!   even when the iterator is just `arrayvec::IntoIter`. `impl Iterator` is
-//!   the only form of `impl Trait` that I use by default, because with collections
-//!   I've found it's very common to start by eagerly generating a collection for
-//!   simplicity, and then go back later to make it a lazy iterator with `O(1)`
-//!   space complexity.
-//! - While it was mostly built with an embedded environment in mind, we need
-//!   to allocate in order to save MIDI files (this isn't inherent in saving
-//!   MIDI files, just an artifact of the library chosen). Additionally, we
-//!   use floating-point maths in order to deal with seconds, but this is just
-//!   for convenience and we could use fixed-point maths as long as we're happy
-//!   to choose a resolution that makes sense for the project. I've also avoided
-//!   `unwrap` except for the results of constant expressions and in `main`.
-//! - I use MIDI as my interchange format, both internally and for writing to
-//!   a file. MIDI is pretty limiting, and in a real project we'd either hard-
-//!   code the sequencer to the synth without a MIDI-like interchange format
-//!   or have a custom interchange format that is a superset of MIDI so that
-//!   we can still output to MIDI and receive MIDI input, just with fewer
-//!   features than when you connect the sequencer to the synth directly.
-//! - Relatedly, I use `ghakuf` as my MIDI library, basically just because it's
-//!   the first library that I found that supports writing MIDI files. I wouldn't
-//!   use this in a real project because it requires allocation and doesn't
-//!   support streaming serialisation of MIDI files. In fact, its method of
-//!   writing MIDI files is really weird, where it has an internal
-//!   `Vec<&'a Message>` instead of `Vec<Message>`, forcing you to have two
-//!   buffers, one for the owned data, and one inside `ghakuf` of references to
-//!   that owned data.
+#![cfg_attr(feature = "nightly", feature(external_doc))]
+#![cfg_attr(feature = "nightly", doc(include = "../README.md"))]
+#![cfg_attr(
+    not(feature = "nightly"),
+    doc = "Use `--features nightly` to see the crate-level documentation"
+)]
 
 // `arraytools` is used for mapping fixed-size arrays to fixed-size arrays. This
-// isn't really necessary, we could use arrayvec. I chose to map fixed-size arrays
-// to fixed-size arrays instead of separately storing the length because in my
-// opinion it expresses intent better, but this is subjective and would be something
-// that would need to be discussed with the rest of the team in code review.
+// isn't really necessary, we could use arrayvec. I chose to add a dependency in
+// order to map fixed-size arrays to fixed-size arrays instead of separately
+// storing the length because in my opinion it expresses intent better, but this
+// is subjective and it need to be discussed with the rest of the team in code
+// review whether it was worth adding a dependency for this.
 use arraytools::ArrayTools;
 // `arrayvec` is used to get dynamically-sized arrays with a fixed upper bound on
 // size. One caveat is that if you use this library and your _actual_ upper bound
-// on size is larger than the one in the `arrayvec`, then functions like `collect`
+// on size is larger than the one in the `ArrayVec`, then functions like `collect`
 // will silently drop data, so you should be careful when using it for user input.
 // We only use it in this project for data that we control that has a strict upper
 // bound, though.
@@ -1227,8 +1156,10 @@ mod tests {
 
         let mut filetest_count = 0;
 
-        let filetest_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/filetests"));
+        let filetest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("filetests");
         let output_dir = filetest_dir.join("test_output");
+        let _ = fs::remove_dir_all(&output_dir);
+        fs::create_dir_all(&output_dir).unwrap();
 
         for file in fs::read_dir(&filetest_dir).unwrap() {
             let file = file.unwrap();
@@ -1251,14 +1182,16 @@ mod tests {
 
                 midi_name.set_extension("mid");
 
+                let output_name = output_dir.join(&midi_name);
+
                 sequencer
-                    .update(Command::EndWrite(output_dir.join(&midi_name)))
+                    .update(Command::EndWrite(output_name.clone()))
                     .unwrap();
 
                 let mut expected = vec![];
                 let mut output = vec![];
 
-                File::open(filetest_dir.join(&midi_name))
+                File::open(output_name)
                     .unwrap()
                     .read_to_end(&mut expected)
                     .unwrap();
@@ -1271,6 +1204,7 @@ mod tests {
             }
         }
 
+        // To ensure we don't accidentally miss out on a test because of a typo in the file name
         assert_eq!(filetest_count, 1);
     }
 }
